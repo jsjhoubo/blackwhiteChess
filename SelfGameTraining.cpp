@@ -1,5 +1,4 @@
-第八关帮我做所有测试， 还有训练胜率一类的
-// Online C++ compiler to run C++ program online
+
 #include <iostream>
 #include <vector>
 #include <utility>
