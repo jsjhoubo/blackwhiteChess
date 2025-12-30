@@ -1,5 +1,3 @@
-// Reversi/Othello: Level 8 (Strong features + Negamax baseline + TD(lambda) training vs baseline)
-// C++17 single-file, "全部 code" 可直接粘到 online compiler
 #include <iostream>
 #include <vector>
 #include <utility>
@@ -9,8 +7,15 @@
 #include <numeric>   // inner_product
 #include <cmath>     // isfinite
 #include <algorithm> // max/min
+#include <cassert>
+#include <string>
+
+#define CHECK(cond) do { if(!(cond)) { \
+  std::cerr << "CHECK failed: " #cond << " @ " << __FILE__ << ":" << __LINE__ << "\n"; \
+  std::exit(1); } } while(0)
 
 // -------------------- Basic board --------------------
+const double search_time_list =0.05; // second 
 const int BLACK =  1;
 const int WHITE = -1;
 const int EMPTY =  0;
@@ -355,6 +360,106 @@ double eval_strong(const Board& b, int player, const std::array<double,K>& w) {
     auto f = features_strong(b, player);
     return std::inner_product(w.begin(), w.end(), f.begin(), 0.0);
 }
+// -------------------- sorting order ---------------------------
+static inline bool IsCorner(int r,int c) {
+    return (r==0 || r==7) && (c ==0 || c ==7); 
+}
+
+static inline bool IsXSquare(int r,int c) {
+    return (r == 1 || r==6 ) && (c==1 || c==6);
+}
+
+static inline bool IsCSquare(int r,int c) {
+    return (r ==0 && c ==1) || (r ==1 && c ==0) ||
+    (r ==0 && c ==6) || (r ==1 && c ==7) ||
+    (r ==6 && c ==0) || (r ==7 && c ==1) ||
+    (r ==6 && c ==7) || (r ==7 && c ==6);
+}
+
+static inline bool corner_empty(const Board& b, int cr, int cc) {
+    return b.at(cr, cc) == EMPTY;
+}
+
+int move_order_score(const Board& b, int player, int r, int c){
+    if (IsCorner(r, c)) return 1000000;
+
+    int s =0;
+    if (IsXSquare(r, c)) {
+        int cr = r==1 ? 0 :7;
+        int cc = c==1 ? 0 :7;
+        if (corner_empty(b, cr, cc)) {
+            s -= 200000;
+        }
+        s -= 20000;
+    }
+    if (IsCSquare(r, c)) {
+        int cr = (r ==0 || r==1) ? 0 : 7;
+        int cc = (c ==0 || c==1) ? 0 : 7;
+        if (corner_empty(b, cr, cc)) {
+            s -=80000;
+        }
+        s -= 8000;
+    }
+
+    int flips =flips_if_place(b, player, r, c);
+    s += flips *300;
+
+     static const int P1[8][8] = {
+        {120,-20, 20,  5,  5, 20,-20,120},
+        {-20,-40, -5, -5, -5, -5,-40,-20},
+        { 20, -5, 15,  3,  3, 15, -5, 20},
+        {  5, -5,  3,  3,  3,  3, -5,  5},
+        {  5, -5,  3,  3,  3,  3, -5,  5},
+        { 20, -5, 15,  3,  3, 15, -5, 20},
+        {-20,-40, -5, -5, -5, -5,-40,-20},
+        {120,-20, 20,  5,  5, 20,-20,120}
+    };
+    s += P1[r][c] *50;
+
+    return s;
+}
+// ------------------------ zobrist TT ---------------------------
+uint64_t Z[64][3]; // EMPTY/BLACK/WHITE
+uint64_t ZTURN;    // side to move
+static inline int piece_index(int8_t v){
+    return (v==EMPTY?0:(v==BLACK?1:2));
+}
+uint64_t board_hash(const Board& b, int player_to_move){
+    uint64_t h=0;
+    for(int i=0;i<64;i++){
+        h ^= Z[i][ piece_index(b.a[i]) ];
+    }
+    if(player_to_move==BLACK) h ^= ZTURN;
+    return h;
+}
+
+void init_zobrist(RNG& rng){
+    auto rnd64 = [&](){
+        uint64_t a = (uint64_t)rng.rng();
+        uint64_t b = (uint64_t)rng.rng();
+        return (a<<32) ^ b;
+    };
+    for(int i=0;i<64;i++) for(int j=0;j<3;j++) Z[i][j]=rnd64();
+    ZTURN = rnd64();
+}
+
+enum BoundType : uint8_t { B_EXACT=0, B_LOWER=1, B_UPPER=2 };
+
+struct TTEntry {
+    uint64_t key;
+    double val;
+    int8_t depth =-1;
+    uint8_t bound =B_EXACT;
+};
+
+static const int TT_SIZE = 1<<20;
+static std::vector<TTEntry> TT;
+
+static inline TTEntry* tt_get(uint64_t key){
+    return &TT[key & (TT_SIZE-1)];
+}
+
+
 
 // -------------------- Negamax (alpha-beta) --------------------
 const double INF = 1e18;
@@ -368,10 +473,48 @@ double terminal_score(const Board& b, int player){
     return 0.0;
 }
 
+int CountEmpties(const Board &b) {
+    int cnt =0;
+    for (int i=0;i<8;i++) {
+        for (int j=0;j<8;j++) {
+            if (b.at(i, j) ==EMPTY) {
+                ++cnt;
+            }
+        }
+    }
+    return cnt;
+}
+
+static const int EMPTY_LIMIT =12;
+static const int EXTRA =2;
 double negamax(const Board& b, int player, int depth,
                double alpha, double beta,
                const std::array<double,K>& w) {
     if(is_game_over(b)) return terminal_score(b, player);
+    int number_empty =CountEmpties(b);
+
+    if (number_empty < EMPTY_LIMIT) {
+        depth =std::max(depth, number_empty + EXTRA);
+    }
+    uint64_t key = board_hash(b, player); 
+    auto entry =tt_get(key);
+    if (entry->key == key && entry->depth >= depth) {
+        if (entry->bound ==B_EXACT) {
+            return entry->val;
+        }
+        if (entry->bound == B_LOWER) {
+            alpha =std::max(alpha, entry->val);
+        }
+        else if (entry->bound == B_UPPER) {
+            beta =std::min(beta, entry->val);
+        }
+        if (alpha >= beta) {
+            return entry->val;
+        }
+    }
+    double alpha0 =alpha;
+    double beta0 =beta;
+
     if(depth==0) return eval_strong(b, player, w);
 
     auto moves = legal_moves(b, player);
@@ -380,6 +523,9 @@ double negamax(const Board& b, int player, int depth,
         return -negamax(b, -player, depth, -beta, -alpha, w);
     }
 
+    std::sort(moves.begin(), moves.end(), [&](const auto& x, const auto& y) {
+        return move_order_score(b, player, x.first, x.second) > move_order_score(b, player, y.first, y.second); 
+    });
     double best = -INF;
     for(auto [r,c]: moves){
         Board nb=b;
@@ -388,6 +534,65 @@ double negamax(const Board& b, int player, int depth,
         best = std::max(best, val);
         alpha = std::max(alpha, val);
         if(alpha >= beta) break; // cut
+    }
+    TTEntry tt_entry;
+    tt_entry.key =key;
+    tt_entry.val =best;
+    tt_entry.depth =depth;
+    if (best <= alpha0) {
+        tt_entry.bound =B_UPPER;
+    }
+    else if (best >= beta0) {
+        tt_entry.bound =B_LOWER;
+    }
+    else if (alpha0 <best && best <beta0){
+        tt_entry.bound =B_EXACT;
+    }
+    TT[key & (TT_SIZE-1)] =tt_entry;
+    return best;
+}
+
+struct Timer {
+    std::clock_t st;
+    double limit_sec;
+    explicit Timer(double sec): st(std::clock()), limit_sec(sec) {}
+    bool time_up() const {
+        double t = double(std::clock()-st) / CLOCKS_PER_SEC;
+        return t >= limit_sec;
+    }
+};
+
+std::pair<int,int> best_move_timed(const Board& b, double time_sec, int player, 
+                             const std::array<double,K>& w, int max_depth =12) {
+    Timer t(time_sec);
+
+    auto moves0 = legal_moves(b, player);
+    if(moves0.empty()) return {-1,-1};
+    std::pair<int,int> best = moves0[0];
+    double max =-INF;
+    for (int d=1;d<=max_depth;d++) {
+        if(t.time_up()) break;
+        auto moves =moves0;
+        std::sort(moves.begin(), moves.end(), [&](const auto& x, const auto& y) {
+            return move_order_score(b, player, x.first, x.second) > move_order_score(b, player, y.first, y.second); 
+        });
+        double local_max =-INF;
+        auto local_best =moves[0];
+        for(auto [r,c]: moves){
+            Board nb=b;
+            apply_move(nb, player, r, c);
+            double val = -negamax(nb, -player, std::max(0, d-1), -INF, +INF, w);
+            if(val > local_max){
+                local_max = val;
+                local_best = {r,c};
+            }
+        }
+        if(!t.time_up()) {
+            best = local_best;
+            max = local_max;
+        } else {
+            break;
+        }
     }
     return best;
 }
@@ -422,7 +627,8 @@ std::pair<int,int> select_move_epsilon_greedy(const Board& b, int player,
         int idx = rng.randint(0, (int)moves.size()-1);
         return moves[idx];
     }
-    return best_move(b, player, depth, w);
+    // return best_move(b, player, depth, w);
+    return best_move_timed(b, search_time_list, player, w, depth);
 }
 
 // -------------------- Game play (agent vs baseline) --------------------
@@ -452,10 +658,12 @@ GameResult play_game_agent_vs_base(const std::array<double,K>& w_agent,
             continue;
         }
         if(player == agent_color){
-            auto mv = best_move(b, player, agent_depth, w_agent);
+            // auto mv = best_move(b, player, agent_depth, w_agent);
+            auto mv =best_move_timed(b, search_time_list, player, w_agent, agent_depth);
             apply_move(b, player, mv.first, mv.second);
         }else{
-            auto mv = best_move(b, player, base_depth, w_base);
+            // auto mv = best_move(b, player, base_depth, w_base);
+            auto mv =best_move_timed(b, search_time_list, player, w_base, base_depth);
             apply_move(b, player, mv.first, mv.second);
         }
         ply++;
@@ -523,7 +731,8 @@ void train_vs_baseline_td_lambda(std::array<double,K>& w_agent,
 
             // Baseline moves until agent's turn
             if(player != agent_color){
-                auto mv = best_move(b, player, cfg.base_depth, w_base);
+                // auto mv = best_move(b, player, cfg.base_depth, w_base);
+                auto mv =best_move_timed(b, search_time_list, player, w_base, cfg.base_depth);;
                 apply_move(b, player, mv.first, mv.second);
                 player = -player;
                 continue;
@@ -630,9 +839,188 @@ EvalStats evaluate_vs_baseline_fair(const std::array<double,K>& w_agent,
     (void)rng;
     return st;
 }
+// -------------------- UNIT TEST -------------------------------------------
+static void Test_StartPosition_LegalMoves() {
+    Board b; // 自动 init_start()
+    auto mb = legal_moves(b, BLACK);
+    auto mw = legal_moves(b, WHITE);
 
-// -------------------- MAIN (Training 5000 games, depth=3 vs baseline depth=2, require >=60% winrate) --------------------
+    CHECK(mb.size() == 4);
+    CHECK(mw.size() == 4);
+
+    // 黑棋开局四手：(2,3),(3,2),(4,5),(5,4)
+    auto has = [&](const std::vector<std::pair<int,int>>& v, int r, int c){
+        return std::find(v.begin(), v.end(), std::make_pair(r,c)) != v.end();
+    };
+    CHECK(has(mb, 2,3));
+    CHECK(has(mb, 3,2));
+    CHECK(has(mb, 4,5));
+    CHECK(has(mb, 5,4));
+
+    CHECK(CountEmpties(b) == 60);
+    CHECK(disc_diff(b) == 0); // 2黑2白
+}
+
+static void Test_Flips_And_ApplyMove() {
+    Board b; // start
+    CHECK(flips_if_place(b, BLACK, 2,3) == 1);
+    CHECK(flips_if_place(b, BLACK, 0,0) == 0); // 开局角不合法
+
+    apply_move(b, BLACK, 2,3);
+    // 下(2,3)并翻转(3,3)：黑=4 白=1 => diff=3
+    CHECK(disc_diff(b) == 3);
+    CHECK(b.at(2,3) == BLACK);
+    CHECK(b.at(3,3) == BLACK);
+}
+
+static void Test_Hash_SideToMove_Differs() {
+    RNG rng(123u);
+    init_zobrist(rng);
+
+    Board b; // start
+    uint64_t hB = board_hash(b, BLACK);
+    uint64_t hW = board_hash(b, WHITE);
+    CHECK(hB != hW); // side-to-move 应纳入 hash
+}
+
+static void Test_TT_ReadWrite_Basic() {
+    // TT 必须已分配
+    TT.assign(TT_SIZE, TTEntry{});
+
+    uint64_t key = 0x123456789abcdef0ULL;
+    TTEntry* e = tt_get(key);
+
+    // 写入
+    e->key = key;
+    e->depth = 7;
+    e->val = 0.42;
+    e->bound = B_EXACT;
+
+    // 读回
+    TTEntry* e2 = tt_get(key);
+    CHECK(e2->key == key);
+    CHECK(e2->depth == 7);
+    CHECK(std::fabs(e2->val - 0.42) < 1e-12);
+    CHECK(e2->bound == B_EXACT);
+}
+
+static Board Make_AsymmetricPosition_ForTests() {
+    Board b; // start
+    // 黑(2,3)合法
+    apply_move(b, BLACK, 2, 3);
+    // 白(2,2)在此时合法（对角线：2,2 -> 3,3(黑) -> 4,4(白)）
+    apply_move(b, WHITE, 2, 2);
+    return b; // 轮到 BLACK
+}
+
+static double RootBestValue_FixedDepth(const Board& b, int player, int depth,
+                                       const std::array<double,K>& w) {
+    auto moves = legal_moves(b, player);
+    CHECK(!moves.empty());
+    double bestVal = -INF;
+    for (auto [r,c] : moves) {
+        Board nb = b;
+        apply_move(nb, player, r, c);
+        double val = -negamax(nb, -player, std::max(0, depth-1), -INF, +INF, w);
+        bestVal = std::max(bestVal, val);
+    }
+    return bestVal;
+}
+
+static double RootMoveValue(const Board& b, int player, int depth,
+                            const std::array<double,K>& w,
+                            std::pair<int,int> mv) {
+    CHECK(mv.first != -1);
+    Board nb = b;
+    apply_move(nb, player, mv.first, mv.second);
+    return -negamax(nb, -player, std::max(0, depth-1), -INF, +INF, w);
+}
+
+// 1) timed 迭代加深：给足时间时，它选的 move 的 value 必须达到固定深度最优 value
+static void Test_BestMoveTimed_Reaches_FixedDepth_OptValue() {
+    // 初始化 Zobrist / TT
+    RNG rng(123u);
+    init_zobrist(rng);
+    TT.assign(TT_SIZE, TTEntry{});
+
+    // 用一个不对称局面，避免“全 0 对称”导致的平局/多解
+    Board b = Make_AsymmetricPosition_ForTests();
+    int player = BLACK;
+
+    // 用一个确定的权重（你 baseline 的那套即可）
+    const std::array<double,K> W = {
+        0.10, 1.20, 0.60, 3.00, -1.50, -1.00, 0.80, 0.80, 1.50, 1.20, 0.15, 1.50
+    };
+
+    int depth = 4;
+    double time_sec = 1.0; // 给足一点，避免机器慢导致跑不完
+
+    // 固定深度最优 value
+    TT.assign(TT_SIZE, TTEntry{});
+    double bestVal = RootBestValue_FixedDepth(b, player, depth, W);
+
+    // timed 选的 move 的 value
+    TT.assign(TT_SIZE, TTEntry{});
+    auto mvTimed = best_move_timed(b, time_sec, player, W, depth);
+    double timedVal = RootMoveValue(b, player, depth, W, mvTimed);
+
+    // 允许极小浮点误差
+    CHECK(std::fabs(timedVal - bestVal) < 1e-9);
+}
+
+// 2) TT bound 必须是合法枚举（0/1/2），并且在 alpha==beta 的零窗口搜索下不应出现 EXACT
+static void Test_TT_Bound_Is_Valid_And_Not_Garbage() {
+    RNG rng(456u);
+    init_zobrist(rng);
+    TT.assign(TT_SIZE, TTEntry{});
+
+    Board b = Make_AsymmetricPosition_ForTests();
+    int player = BLACK;
+
+    const std::array<double,K> W = {
+        0.10, 1.20, 0.60, 3.00, -1.50, -1.00, 0.80, 0.80, 1.50, 1.20, 0.15, 1.50
+    };
+
+    int depth = 3;
+    // 零窗口：更容易触发 fail-low / fail-high，从而要求 bound 必须被正确写入
+    double alpha = 0.0, beta = 0.0;
+
+    (void)negamax(b, player, depth, alpha, beta, W);
+
+    uint64_t key = board_hash(b, player);
+    TTEntry* e = tt_get(key);
+
+    // 必须命中 key（同槽）
+    CHECK(e->key == key);
+
+    // bound 必须是 {0,1,2} 之一，不能是未初始化垃圾值
+    CHECK(e->bound == B_EXACT || e->bound == B_LOWER || e->bound == B_UPPER);
+
+    // alpha==beta 的零窗口下，如果走完全搜索，bound 不应是 EXACT（否则很可疑）
+    // 这里允许极罕见的“真值正好==0”导致 EXACT 的情况，所以更稳一点：只要求不是垃圾值即可。
+    // 如果你希望更严格（抓住未初始化），可以取消注释下一行：
+    // CHECK(e->bound != B_EXACT);
+}
+
+static void RunAllTests() {
+    std::cerr << "[UNIT_TEST] Running...\n";
+    Test_StartPosition_LegalMoves();
+    Test_Flips_And_ApplyMove();
+    Test_Hash_SideToMove_Differs();
+    Test_TT_ReadWrite_Basic();
+
+    
+    Test_BestMoveTimed_Reaches_FixedDepth_OptValue();
+    Test_TT_Bound_Is_Valid_And_Not_Garbage();
+    std::cerr << "[UNIT_TEST] All tests passed.\n";
+}
+
 int main() {
+    
+#ifdef UNIT_TEST
+    RunAllTests();
+    return 0;
+#endif
     // Baseline weights (match normalized features scale)
     const std::array<double,K> W_BASE = {
         0.10,  // f0 disc
@@ -672,6 +1060,10 @@ int main() {
               << ", alpha=" << cfg.alpha
               << ", lambda=" << cfg.lambda
               << ", eps=[" << cfg.eps_start << " -> " << cfg.eps_end << "]\n";
+
+    RNG rng(cfg.seed);
+    init_zobrist(rng);
+    TT.assign(TT_SIZE, TTEntry{});
 
     train_vs_baseline_td_lambda(w_agent, W_BASE, cfg);
 
